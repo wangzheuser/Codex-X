@@ -40,7 +40,13 @@ Codex 始终使用 Responses，本地路由负责转换请求及普通 / 流式�
 
 ## 编辑 Headers
 
-在供应商表单中添加固定值或环境变量来源的 Header，例如 `HTTP-Referer`、`X-Title`、`User-Agent`。
+在供应商表单中添加固定值或环境变量来源的 Header。
+
+`User-Agent` 用于客户端标识，可手动填写或明确选择 Claude Code / Kilo Code 预设。预设只添加或更新一个 `User-Agent` 固定值，其他请求头保留；不选预设就保持现有设置。预设值来自本次核对的 CC Switch 配置，不保证每家供应商均接受，也不会填入任何 API Key。
+
+填写示例随名称变化：`HTTP-Referer` 填应用网址，`X-Title` / `X-OpenRouter-Title` 填应用名称，认证头按供应商文档填写。`X-Title: Codex-X` 表示应用名称，是合法的可选标识；它不承担 User-Agent 客户端校验的作用。占位提示不会作为实际值保存或发送。
+
+CC Switch 的 Codex 页面将 UA 保存在 `meta.customUserAgent`，日常转发通过本地路由生效；其通用 Headers 键值编辑器主要用于 OpenCode / Pi。Codex-X 将这些字段保存到 Codex 原生 `http_headers` / `env_http_headers`：直连由 Codex 发送，路由模式由 Codex-X 发送。
 同一个名称不能重复（忽略大小写），字段错误直接显示在对应行。固定值保留原有空格。
 环境变量模式仅保存变量名：直连时由 Codex 读取，经过路由时由 Codex-X 读取，请在启动应用前设置变量。
 

@@ -8,6 +8,14 @@
 
 日志不得包含 Token、认证文件内容、用户数据或仅适用于某台电脑的隐私路径。
 
+## 2026-10-08：Headers 预设与填写提示补齐
+
+- 用户指出供应商 Headers 缺少可选择预设，通用 `Codex-X` 值示例容易误导。复核 Issue #53 原文仅要求 Header 设置；CC Switch 的 Codex 界面使用独立 UA 控件及 `meta.customUserAgent`，通用 `X-Title` / `CC Switch` 示例来自 OpenCode / Pi 编辑器。
+- 新增用户显式选择的 Claude Code、Kilo Code `User-Agent` 预设；只更新一个 UA 行，优先复用空白草稿，不覆盖其他请求头/凭据/环境变量，重复行继续显示校验错误。不自动配置客户端身份，不生成认证凭据。
+- 填写提示按 UA、应用网址、应用名称、认证及其他 Header 区分；占位值不保存或发送。保留通用 Headers 和固定/环境变量设置，直连及路由发送行为保持原有实现。
+- 新增 9 项预设逻辑测试、中英文实际组件预设/占位渲染测试；130 项前端测试、类型检查和 renderer 构建通过。本次未修改后端、未请求真实上游。
+- macOS release 本机打包、签名/二进制摘要校验及旧 App ZIP 备份通过，已更新 Applications 中的安装。当前窗口存在未保存的供应商编辑，因此保留原进程和草稿；用户结束编辑并重开后使用新预设。构建 App 副本经校验归档，未推送 GitHub。
+
 ## 2026-10-08：供应商协议转换、配置定位和 Headers（待本地验收）
 
 - Issue #68：原路由仅透传 Responses；新增独立上游协议元数据及 Chat Completions、Claude Messages、Gemini 原生 JSON/SSE 转换。Codex TOML 始终使用 Responses，DB v8→v9 新增可空协议列，旧记录保留，历史 Chat 配置兼容转换。CC Switch 的显式协议按元数据导入，模型获取与连接检测使用所选协议和供应商 Headers。

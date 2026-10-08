@@ -187,11 +187,29 @@ for (const lang of ["zh", "en"]) {
     assert.equal(control(html, "input", `${valueLabel} · ${rowLabel(0)}`).attrs["aria-invalid"], "false", "a name error must not mark that row's valid value invalid");
   });
 
+  test(`Headers editor offers explicit UA presets and header-specific examples (${lang})`, async () => {
+    const { ProviderHeadersEditor } = await ui();
+    const empty = render(ProviderHeadersEditor, { lang, rows: [], onChange: noop });
+    const preset = control(empty, "select", zh ? "User-Agent 预设" : "User-Agent presets");
+    assert.deepEqual(elements(preset.tag, "option").map(({ attrs }) => attrs.value), ["", "claude_code", "kilo_code"]);
+    assert.ok(preset.tag.includes("claude-cli/2.1.161 (external, cli)"));
+    assert.ok(preset.tag.includes("Kilo-Code/1.0"));
+    assert.equal(elements(empty, "input").length, 0, "mounting must not create headers from presets");
+    assert.ok(empty.includes(zh ? "其他请求头保留" : "keep other headers"));
+    const names = ["User-Agent", "HTTP-Referer", "X-Title", "Authorization"];
+    const html = render(ProviderHeadersEditor, { lang, rows: names.map((name) => ({ name, value: "", source: "static" })), onChange: noop });
+    const placeholders = names.map((_, index) => control(html, "input", `${valueLabel} · ${rowLabel(index)}`).attrs.placeholder);
+    assert.equal(new Set(placeholders).size, names.length);
+    assert.ok(placeholders.every((placeholder) => !placeholder.includes("Codex-X")));
+    assert.ok(placeholders[1].includes("https://your-app.example"));
+    assert.ok(placeholders[3].includes("Bearer "));
+  });
+
   test(`disabled Headers editor disables every row control (${lang})`, async () => {
     const { ProviderHeadersEditor } = await ui();
     const html = render(ProviderHeadersEditor, { lang, rows: validRows, disabled: true, onChange: noop });
     const controls = ["input", "select", "button"].flatMap((name) => elements(html, name));
-    assert.equal(controls.length, 9);
+    assert.equal(controls.length, 10);
     assert.ok(controls.every(({ attrs }) => "disabled" in attrs));
   });
 

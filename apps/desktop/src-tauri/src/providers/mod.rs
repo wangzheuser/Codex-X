@@ -66,7 +66,8 @@ pub(crate) use store::{
     rollback_provider_store_inner, save_detected_provider_with_rollback_inner, save_provider_inner,
     save_provider_order_inner, save_provider_with_rollback_inner, strip_provider_bearer_tokens,
     upsert_ccswitch_provider_on_connection, DuplicateProviderResult, ProviderStoreRollback,
-    ProviderUpsertKind, SavedProvider,
+    ProviderUpsertKind, SavedProvider, ProviderHeader,
+    read_provider_headers_inner, update_provider_headers_inner,
 };
 
 pub(crate) fn open_store() -> Result<Connection> {

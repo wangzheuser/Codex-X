@@ -5,7 +5,170 @@ use crate::{now_rfc3339, resolve_codex_dir, sanitize_id};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use toml_edit::{value, DocumentMut};
+use toml_edit::{value, DocumentMut, Item, Table};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ProviderHeaderSource {
+    Static,
+    Env,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderHeader {
+    pub(crate) name: String,
+    pub(crate) value: String,
+    pub(crate) source: ProviderHeaderSource,
+}
+
+fn provider_headers_from_table(table: &Table) -> Result<Vec<ProviderHeader>> {
+    let mut result = Vec::new();
+    for (field, source) in [
+        ("http_headers", ProviderHeaderSource::Static),
+        ("env_http_headers", ProviderHeaderSource::Env),
+    ] {
+        let Some(item) = table.get(field) else {
+            continue;
+        };
+        let headers = item
+            .as_table_like()
+            .ok_or_else(|| CodexxError::Config(format!("供应商 {field} 必须是键值表")))?;
+        for (name, item) in headers.iter() {
+            let text = item
+                .as_str()
+                .ok_or_else(|| CodexxError::Config(format!("供应商 {field} 的值必须是文本")))?;
+            result.push(ProviderHeader {
+                name: name.to_string(),
+                value: text.to_string(),
+                source,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn validate_provider_headers(headers: &[ProviderHeader]) -> Result<()> {
+    let mut names = HashSet::new();
+    for (index, header) in headers.iter().enumerate() {
+        let row = index + 1;
+        reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| CodexxError::Config(format!("第 {row} 个供应商 Header 名称无效")))?;
+        if !names.insert(header.name.to_ascii_lowercase()) {
+            return Err(CodexxError::Config(format!(
+                "第 {row} 个供应商 Header 名称重复（不区分大小写）"
+            )));
+        }
+        match header.source {
+            ProviderHeaderSource::Static => {
+                reqwest::header::HeaderValue::from_str(&header.value).map_err(|_| {
+                    CodexxError::Config(format!(
+                        "第 {row} 个供应商 Header ({}) 值无效，不能包含换行或控制字符",
+                        header.name
+                    ))
+                })?;
+            }
+            ProviderHeaderSource::Env => {
+                let mut bytes = header.value.bytes();
+                let valid_first = bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+                if !valid_first || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+                    return Err(CodexxError::Config(format!(
+                        "第 {row} 个供应商 Header ({}) 环境变量名无效，请使用字母、数字和下划线，且不要以数字开头", header.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provider_header_table(table: &Table) -> Result<()> {
+    validate_provider_headers(&provider_headers_from_table(table)?)
+}
+
+fn selected_provider_id(doc: &DocumentMut) -> Result<String> {
+    doc.get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少 model_provider".to_string()))
+}
+
+/// Read only the selected provider's headers. Invalid names and values remain
+/// visible to the editor so users can repair older configurations.
+pub(crate) fn read_provider_headers_inner(config_text: String) -> Result<Vec<ProviderHeader>> {
+    let doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|_| CodexxError::Config("供应商 TOML 无效，请先修正配置".to_string()))?;
+    let provider_id = selected_provider_id(&doc)?;
+    let table = doc
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(Item::as_table)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少当前供应商配置表".to_string()))?;
+    provider_headers_from_table(table)
+}
+
+/// Patch Codex's native TOML fields without changing credentials or unrelated
+/// provider/shared configuration. An empty list removes both header fields.
+pub(crate) fn update_provider_headers_inner(
+    config_text: String,
+    mut headers: Vec<ProviderHeader>,
+) -> Result<String> {
+    for header in &mut headers {
+        header.name = header.name.trim().to_string();
+    }
+    validate_provider_headers(&headers)?;
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|_| CodexxError::Config("供应商 TOML 无效，请先修正配置".to_string()))?;
+    let provider_id = selected_provider_id(&doc)?;
+    let table = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| CodexxError::Config("供应商 TOML 缺少当前供应商配置表".to_string()))?;
+    for (field, source) in [
+        ("http_headers", ProviderHeaderSource::Static),
+        ("env_http_headers", ProviderHeaderSource::Env),
+    ] {
+        let rows = headers
+            .iter()
+            .filter(|header| header.source == source)
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            table.remove(field);
+            continue;
+        }
+        // Retain table style, comments and ordering for existing header names.
+        if table.get(field).and_then(Item::as_table_like).is_none() {
+            table.insert(field, Item::Table(Table::new()));
+        }
+        let values = table
+            .get_mut(field)
+            .and_then(Item::as_table_like_mut)
+            .unwrap();
+        let removed = values
+            .iter()
+            .filter(|(name, _)| !rows.iter().any(|header| header.name == *name))
+            .map(|(name, _)| name.to_string())
+            .collect::<Vec<_>>();
+        for name in removed {
+            values.remove(&name);
+        }
+        for header in rows {
+            if values.get(&header.name).and_then(Item::as_str) != Some(header.value.as_str()) {
+                values.insert(&header.name, value(header.value.clone()));
+            }
+        }
+    }
+    Ok(doc.to_string().trim_end().to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -182,17 +345,15 @@ pub(crate) fn provider_template_from_document(
     provider_id: &str,
     model: &str,
 ) -> Result<String> {
-    let provider_exists = doc
+    let provider_table = doc
         .get("model_providers")
         .and_then(|item| item.as_table())
         .and_then(|providers| providers.get(provider_id))
         .and_then(|item| item.as_table())
-        .is_some();
-    if !provider_exists {
-        return Err(CodexxError::Config(format!(
-            "供应商 TOML 缺少 [model_providers.{provider_id}]"
-        )));
-    }
+        .ok_or_else(|| {
+            CodexxError::Config(format!("供应商 TOML 缺少 [model_providers.{provider_id}]"))
+        })?;
+    validate_provider_header_table(provider_table)?;
 
     let mut template = doc.clone();
     template["model_provider"] = value(provider_id);
@@ -1282,6 +1443,155 @@ pub(crate) fn experimental_bearer_token_from_doc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HEADER_CONFIG: &str = r#"# keep the shared configuration
+model_provider = "custom"
+model = "gpt-test"
+
+[model_providers.custom]
+name = "Header provider"
+base_url = "https://header.example.test/v1"
+wire_api = "responses"
+http_headers = { "X-Title" = "Codex-X" }
+env_http_headers = { "X-Project" = "PROJECT_ID" }
+
+[model_providers.other.http_headers]
+X-Other = "keep-other-provider"
+
+[mcp_servers.keep]
+command = "fixture-server"
+"#;
+
+    fn header(name: &str, text: &str, source: ProviderHeaderSource) -> ProviderHeader {
+        ProviderHeader {
+            name: name.to_string(),
+            value: text.to_string(),
+            source,
+        }
+    }
+
+    #[test]
+    fn headers_read_patch_and_remove_only_touch_the_selected_provider() {
+        let rows = read_provider_headers_inner(HEADER_CONFIG.to_string()).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                header("X-Title", "Codex-X", ProviderHeaderSource::Static),
+                header("X-Project", "PROJECT_ID", ProviderHeaderSource::Env),
+            ]
+        );
+        let next = update_provider_headers_inner(
+            HEADER_CONFIG.to_string(),
+            vec![
+                header(
+                    " User-Agent ",
+                    "  custom agent  ",
+                    ProviderHeaderSource::Static,
+                ),
+                header("X-Project", "PROJECT_ID", ProviderHeaderSource::Env),
+            ],
+        )
+        .unwrap();
+        let doc = next.parse::<DocumentMut>().unwrap();
+        assert!(next.contains("# keep the shared configuration"));
+        assert_eq!(
+            doc["mcp_servers"]["keep"]["command"].as_str(),
+            Some("fixture-server")
+        );
+        assert_eq!(
+            doc["model_providers"]["other"]["http_headers"]["X-Other"].as_str(),
+            Some("keep-other-provider")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["http_headers"]["User-Agent"].as_str(),
+            Some("  custom agent  ")
+        );
+        assert!(doc["model_providers"]["custom"]["http_headers"]
+            .as_table_like()
+            .unwrap()
+            .get("X-Title")
+            .is_none());
+        let removed = update_provider_headers_inner(next, Vec::new()).unwrap();
+        assert!(read_provider_headers_inner(removed.clone())
+            .unwrap()
+            .is_empty());
+        let removed = removed.parse::<DocumentMut>().unwrap();
+        assert!(removed["model_providers"]["custom"]
+            .as_table()
+            .unwrap()
+            .get("http_headers")
+            .is_none());
+        assert!(removed["model_providers"]["custom"]
+            .as_table()
+            .unwrap()
+            .get("env_http_headers")
+            .is_none());
+    }
+
+    #[test]
+    fn headers_patch_accepts_table_syntax_and_preserves_unchanged_comments() {
+        let text = HEADER_CONFIG.replace("http_headers = { \"X-Title\" = \"Codex-X\" }\nenv_http_headers = { \"X-Project\" = \"PROJECT_ID\" }", "[model_providers.custom.http_headers]\n# keep header comment\nX-Title = \"Codex-X\" # keep value comment\n[model_providers.custom.env_http_headers]\nX-Project = \"PROJECT_ID\"");
+        let rows = read_provider_headers_inner(text.clone()).unwrap();
+        let patched = update_provider_headers_inner(text.clone(), rows).unwrap();
+        assert_eq!(patched, text.trim_end());
+    }
+
+    #[test]
+    fn headers_reject_duplicate_names_and_injection_without_echoing_values() {
+        for rows in [
+            vec![
+                header("X-Test", "secret", ProviderHeaderSource::Static),
+                header("x-test", "PROJECT_ID", ProviderHeaderSource::Env),
+            ],
+            vec![header("bad:name", "secret", ProviderHeaderSource::Static)],
+            vec![header(
+                "X-Test",
+                "secret\r\nInjected: yes",
+                ProviderHeaderSource::Static,
+            )],
+            vec![header("X-Test", "secret\0", ProviderHeaderSource::Static)],
+            vec![header(
+                "X-Test",
+                "PROJECT=secret",
+                ProviderHeaderSource::Env,
+            )],
+        ] {
+            let error = update_provider_headers_inner(HEADER_CONFIG.to_string(), rows)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("secret"));
+            assert!(error.contains("供应商 Header"));
+        }
+    }
+
+    #[test]
+    fn invalid_legacy_headers_can_be_read_and_repaired_but_cannot_be_saved() {
+        let text = HEADER_CONFIG.replace("\"Codex-X\"", "\"secret\\r\\ninjection\"");
+        let rows = read_provider_headers_inner(text.clone()).unwrap();
+        assert_eq!(rows[0].value, "secret\r\ninjection");
+        let doc = text.parse::<DocumentMut>().unwrap();
+        assert!(provider_template_from_document(&doc, "custom", "gpt-test").is_err());
+        let repaired = update_provider_headers_inner(
+            text,
+            vec![header("X-Title", "safe", ProviderHeaderSource::Static)],
+        )
+        .unwrap();
+        assert!(provider_template_from_document(
+            &repaired.parse::<DocumentMut>().unwrap(),
+            "custom",
+            "gpt-test"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn headers_reject_malformed_tables_and_non_text_values() {
+        for replacement in ["http_headers = 4", "http_headers = { X-Test = 4 }"] {
+            let text =
+                HEADER_CONFIG.replace("http_headers = { \"X-Title\" = \"Codex-X\" }", replacement);
+            assert!(read_provider_headers_inner(text).is_err());
+        }
+    }
 
     fn test_connection() -> Connection {
         let conn = Connection::open_in_memory().expect("open provider test database");

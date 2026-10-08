@@ -3235,6 +3235,11 @@ function App() {
                   setProviderTomlDirty(true);
                   if (origin === "manual") setProviderCommonConfigDirty(true);
                 }}
+                onProviderHeadersConfigChange={(value) => {
+                  providerDraftRequestRef.current += 1;
+                  setProviderTomlDraft(value);
+                  setProviderForm((current) => ({ ...current, tomlConfig: value }));
+                }}
                 onResetProviderToml={() => {
                   providerDraftRequestRef.current += 1;
                   setProviderTomlDraft(

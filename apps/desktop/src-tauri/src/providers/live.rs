@@ -1203,6 +1203,7 @@ fn merge_provider_toml_into_live_with_policy(
                 "config.toml 缺少 [model_providers.{source_provider_id}]"
             ))
         })?;
+    super::store::validate_provider_header_table(&source_provider)?;
     let source_name = source_provider
         .get("name")
         .and_then(|item| item.as_str())
@@ -1767,6 +1768,52 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn header_values_survive_direct_toml_activation_and_invalid_values_are_rejected() {
+        let config = "model_provider='custom'\nmodel='gpt-test'\n[model_providers.custom]\nname='Header fixture'\nbase_url='https://headers.example.test/v1'\nwire_api='responses'\nrequires_openai_auth=false\nhttp_headers={User-Agent='Fixture agent'}\nenv_http_headers={X-Project='PROJECT_ID'}\n";
+        let (doc, _) =
+            merge_provider_toml_into_live(Path::new("fixture.toml"), "", config, None).unwrap();
+        assert_eq!(
+            doc["model_providers"]["custom"]["http_headers"]["User-Agent"].as_str(),
+            Some("Fixture agent")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["env_http_headers"]["X-Project"].as_str(),
+            Some("PROJECT_ID")
+        );
+        let invalid = config.replace(
+            "User-Agent='Fixture agent'",
+            "User-Agent=\"secret\\r\\ninjected\"",
+        );
+        let error = merge_provider_toml_into_live(Path::new("fixture.toml"), "", &invalid, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Header"));
+        assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn explicit_api_key_removes_stale_authorization_headers_from_both_sources() {
+        let mut doc = "[custom]\nhttp_headers={Authorization='Bearer stale',X-Trace='keep'}\nenv_http_headers={aUtHoRiZaTiOn='STALE_AUTH',X-Project='PROJECT_ID'}\n".parse::<DocumentMut>().unwrap();
+        let table = doc["custom"].as_table_mut().unwrap();
+        configure_live_provider_auth(table, Some("fixture-key"), false);
+        assert!(table["http_headers"]
+            .as_table_like()
+            .unwrap()
+            .get("Authorization")
+            .is_none());
+        assert!(table["env_http_headers"]
+            .as_table_like()
+            .unwrap()
+            .get("aUtHoRiZaTiOn")
+            .is_none());
+        assert_eq!(table["http_headers"]["X-Trace"].as_str(), Some("keep"));
+        assert_eq!(
+            table["env_http_headers"]["X-Project"].as_str(),
+            Some("PROJECT_ID")
+        );
+    }
 
     fn active_provider_fixture(
         tag: u64,
@@ -2848,7 +2895,7 @@ command = "docs-server"
             r#"env_key = "STALE_ENV_KEY"
 env_key_instructions = "Stale environment instructions"
 auth = { command = "fixture-never-executed" }
-http_headers = { Authorization = "Bearer stale", "X-Trace" = "keep-static" }
+http_headers = { "X-Trace" = "keep-static" }
 env_http_headers = { aUtHoRiZaTiOn = "STALE_AUTH", "X-Project" = "PROJECT_ENV" }
 "#,
         );

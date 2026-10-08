@@ -540,6 +540,8 @@ wire_api = "responses"
 requires_openai_auth = false
 experimental_bearer_token = "sk-from-config"
 request_max_retries = 7
+http_headers = { "HTTP-Referer" = "https://header.example.test", "User-Agent" = "Fixture agent" }
+env_http_headers = { "X-Project" = "PROJECT_ID" }
 
 [model_providers.other]
 name = "Other provider"
@@ -606,6 +608,18 @@ command = "docs-server"
         assert_eq!(
             doc["model_providers"]["custom"]["request_max_retries"].as_integer(),
             Some(7)
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["http_headers"]["HTTP-Referer"].as_str(),
+            Some("https://header.example.test")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["http_headers"]["User-Agent"].as_str(),
+            Some("Fixture agent")
+        );
+        assert_eq!(
+            doc["model_providers"]["custom"]["env_http_headers"]["X-Project"].as_str(),
+            Some("PROJECT_ID")
         );
         assert_eq!(
             doc["model_providers"]["other"]["base_url"].as_str(),

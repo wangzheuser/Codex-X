@@ -1037,6 +1037,19 @@ async fn build_provider_toml_draft(
     .map_err(|e| CodexxError::Config(format!("生成供应商 TOML 失败: {e}")))?
 }
 
+#[tauri::command]
+fn read_provider_headers(config_text: String) -> Result<Vec<providers::ProviderHeader>> {
+    providers::read_provider_headers_inner(config_text)
+}
+
+#[tauri::command]
+fn update_provider_headers(
+    config_text: String,
+    headers: Vec<providers::ProviderHeader>,
+) -> Result<String> {
+    providers::update_provider_headers_inner(config_text, headers)
+}
+
 fn save_provider_command_inner(provider: SavedProvider) -> Result<SavedProvider> {
     let saved = save_provider_inner(provider)?;
     failover::refresh_saved_routes().map_err(|error| {
@@ -1849,6 +1862,8 @@ pub fn run() {
             save_provider_order,
             get_provider_config_base,
             build_provider_toml_draft,
+            read_provider_headers,
+            update_provider_headers,
             save_provider,
             duplicate_provider,
             update_codex_context_window,

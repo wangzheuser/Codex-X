@@ -25,6 +25,7 @@ import { PageTransition } from "../components/PageTransition";
 import { OfficialQuotaDialog } from "../components/OfficialQuotaDialog";
 import { OfficialAccountBadge } from "../components/OfficialAccountBadge";
 import { ProviderModelMappings, validateProviderModelMappings } from "../components/ProviderModelMappings";
+import { ProviderHeadersControl } from "../components/ProviderHeadersControl";
 import { ProviderPresetPicker } from "../components/ProviderPresetPicker";
 import { PROVIDER_PRESETS, getProviderPreset, getProviderPresetVariant } from "../providerPresets";
 import { Button, Checkbox, ModalShell } from "../components/ui";
@@ -200,6 +201,7 @@ export type ProvidersPageProps = {
   onRequiresAuthChange: (value: boolean) => void;
   onToggleApiKeyVisibility: () => void;
   onProviderTomlDraftChange: (value: string, origin?: "manual" | "context") => void;
+  onProviderHeadersConfigChange: (value: string) => void;
   onResetProviderToml: () => void;
   onSaveProvider: () => void;
 };
@@ -863,13 +865,17 @@ function ProviderForm({
   onRequiresAuthChange,
   onToggleApiKeyVisibility,
   onProviderTomlDraftChange,
+  onProviderHeadersConfigChange,
   onResetProviderToml,
   onSaveProvider,
-}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "providerForm" | "providerModelMappings" | "onProviderModelMappingsChange" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onWireApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onResetProviderToml" | "onSaveProvider">) {
+}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "providerForm" | "providerModelMappings" | "onProviderModelMappingsChange" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onWireApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onProviderHeadersConfigChange" | "onResetProviderToml" | "onSaveProvider">) {
   const modelListId = useId();
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
+  const [headersBusy, setHeadersBusy] = useState(false);
+  const [headersValid, setHeadersValid] = useState(true);
+  const [headersRevision, setHeadersRevision] = useState(0);
   const canFetchModels = Boolean(providerForm.baseUrl.trim() && providerForm.apiKey.trim());
-  const formBusy = loading || fetchingModels || contextWindowBusy;
+  const formBusy = loading || fetchingModels || contextWindowBusy || headersBusy;
   const mappingsValid = validateProviderModelMappings(providerModelMappings, providerForm.model, lang).valid;
 
   return (
@@ -964,6 +970,16 @@ function ProviderForm({
         </div>
       </section>
 
+      <ProviderHeadersControl
+        key={`headers:${editingProviderId ?? "new-provider"}:${selectedPresetId}:${selectedPresetVariantId}:${headersRevision}`}
+        lang={lang}
+        configText={providerTomlDraft}
+        disabled={loading || fetchingModels || contextWindowBusy}
+        onConfigChange={onProviderHeadersConfigChange}
+        onBusyChange={setHeadersBusy}
+        onValidityChange={setHeadersValid}
+      />
+
       <ProviderModelMappings
         key={editingProviderId ?? "new-provider"}
         lang={lang}
@@ -984,15 +1000,16 @@ function ProviderForm({
           <div><h3>{copy.tomlTitle}</h3><p>{copy.tomlDescription}</p></div>
           <div className="cx-providers-context-actions">
             <ContextWindowControl lang={lang} configText={providerTomlDraft} onConfigChange={(value) => onProviderTomlDraftChange(value, "context")} disabled={formBusy} onBusyChange={setContextWindowBusy} />
-            <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={onResetProviderToml} disabled={formBusy}><RefreshCw size={14} aria-hidden="true" />{copy.resetTomlLabel}</button>
+            <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small" onClick={() => { setHeadersRevision((value) => value + 1); onResetProviderToml(); }} disabled={formBusy}><RefreshCw size={14} aria-hidden="true" />{copy.resetTomlLabel}</button>
           </div>
         </div>
-        <textarea ref={providerTomlRef} className="cx-providers-code-editor cx-providers-toml-editor" aria-label={copy.tomlTitle} value={providerTomlDraft} onChange={(event) => onProviderTomlDraftChange(event.target.value)} disabled={formBusy} spellCheck={false} />
+        <textarea ref={providerTomlRef} className="cx-providers-code-editor cx-providers-toml-editor" aria-label={copy.tomlTitle} value={providerTomlDraft} onChange={(event) => { setHeadersRevision((value) => value + 1); onProviderTomlDraftChange(event.target.value); }} disabled={formBusy} spellCheck={false} />
       </section>
 
       <div className="cx-providers-form-actions cx-providers-form-actions--save">
+        {!headersValid && <span className="cx-provider-mappings-save-hint">{lang === "zh" ? "请先修正请求头中的错误。" : "Correct the HTTP header errors before saving."}</span>}
         {!mappingsValid && <span className="cx-provider-mappings-save-hint">{lang === "zh" ? "请先修正模型映射中的错误。" : "Correct the model mapping errors before saving."}</span>}
-        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveProvider} disabled={formBusy || !mappingsValid}>
+        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveProvider} disabled={formBusy || !mappingsValid || !headersValid}>
           {loading ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" /> : <CheckCircle2 size={15} aria-hidden="true" />}
           {loading ? copy.savingLabel : copy.saveLabel}
         </button>

@@ -180,6 +180,9 @@ pub(crate) struct SavedProvider {
     pub(crate) api_key: Option<String>,
     pub(crate) toml_config: Option<String>,
     pub(crate) wire_api: String,
+    /// Upstream format used by the app's local bridge; Codex still speaks Responses.
+    #[serde(default)]
+    pub(crate) upstream_api: Option<String>,
     pub(crate) requires_openai_auth: bool,
     #[serde(default)]
     pub(crate) model_mappings: Vec<super::model_catalog::ProviderModelMapping>,
@@ -520,6 +523,7 @@ fn saved_provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedPro
         api_key: row.get(4)?,
         toml_config: row.get(5)?,
         wire_api: row.get(6)?,
+        upstream_api: row.get(9)?,
         requires_openai_auth: row.get::<_, i64>(7)? != 0,
         model_mappings: serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -535,7 +539,7 @@ fn stored_providers_on_connection(conn: &Connection) -> Result<Vec<StoredProvide
     let mut stmt = conn
         .prepare(
             "SELECT id, provider_name, base_url, model, api_key, toml_config, wire_api,
-                    requires_openai_auth, model_mappings_json, created_at, updated_at, source, source_id
+                    requires_openai_auth, model_mappings_json, upstream_api, created_at, updated_at, source, source_id
              FROM providers
              ORDER BY created_at ASC, rowid ASC",
         )
@@ -544,10 +548,10 @@ fn stored_providers_on_connection(conn: &Connection) -> Result<Vec<StoredProvide
         .query_map([], |row| {
             Ok(StoredProvider {
                 provider: saved_provider_from_row(row)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-                source: row.get(11)?,
-                source_id: row.get(12)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+                source: row.get(12)?,
+                source_id: row.get(13)?,
             })
         })
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -668,7 +672,7 @@ pub(crate) fn provider_by_id_on_connection(
     let mut stmt = conn
         .prepare(
             "SELECT id, provider_name, base_url, model, api_key, toml_config, wire_api,
-                    requires_openai_auth, model_mappings_json
+                    requires_openai_auth, model_mappings_json, upstream_api
              FROM providers WHERE id = ?1 LIMIT 1",
         )
         .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -703,8 +707,8 @@ fn write_provider_with_origin(
     conn.execute(
         "INSERT INTO providers
             (id, provider_name, base_url, model, api_key, toml_config, wire_api,
-             requires_openai_auth, model_mappings_json, source, source_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+             requires_openai_auth, model_mappings_json, upstream_api, source, source_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
          ON CONFLICT(id) DO UPDATE SET
             provider_name = excluded.provider_name,
             base_url = excluded.base_url,
@@ -714,6 +718,7 @@ fn write_provider_with_origin(
             wire_api = excluded.wire_api,
             requires_openai_auth = excluded.requires_openai_auth,
             model_mappings_json = excluded.model_mappings_json,
+            upstream_api = excluded.upstream_api,
             source = CASE
                 WHEN excluded.source_id IS NULL THEN providers.source
                 ELSE excluded.source
@@ -733,6 +738,7 @@ fn write_provider_with_origin(
             provider.wire_api,
             if provider.requires_openai_auth { 1 } else { 0 },
             model_mappings_json,
+            provider.upstream_api,
             source,
             source_id,
             now,
@@ -794,6 +800,11 @@ fn merge_authoritative_import(
     }
     if incoming.model_mappings.is_empty() {
         incoming.model_mappings = existing.model_mappings.clone();
+    }
+    // CC Switch can refresh native TOML without knowing the local bridge's
+    // format selection. Keep the app metadata unless the import supplies one.
+    if incoming.upstream_api.is_none() {
+        incoming.upstream_api = existing.upstream_api.clone();
     }
     incoming
 }
@@ -999,6 +1010,59 @@ fn normalize_stored_provider_from_toml(provider: &mut SavedProvider) {
     // TOML template. Reads must trust a valid template without making one bad
     // legacy row prevent the provider list from loading.
     let _ = apply_provider_toml_authority(provider);
+    if normalize_provider_upstream_api(provider).is_ok() && provider.upstream_api.is_some() {
+        // Migrate legacy native Chat templates in memory, preserving comments
+        // and the independent bridge format instead of putting metadata in TOML.
+        if let Some(mut doc) = provider
+            .toml_config
+            .as_deref()
+            .and_then(|text| text.parse::<DocumentMut>().ok())
+        {
+            if let Ok(id) = selected_provider_id(&doc) {
+                if let Some(table) = doc
+                    .get_mut("model_providers")
+                    .and_then(Item::as_table_mut)
+                    .and_then(|providers| providers.get_mut(&id))
+                    .and_then(Item::as_table_mut)
+                {
+                    if table.get("wire_api").and_then(Item::as_str) != Some("responses") {
+                        table["wire_api"] = value("responses");
+                    }
+                    provider.toml_config = Some(doc.to_string().trim_end().to_string());
+                }
+            }
+        }
+    }
+}
+
+fn normalize_provider_upstream_api(provider: &mut SavedProvider) -> Result<()> {
+    if !matches!(
+        provider.wire_api.trim(),
+        "" | "responses" | "chat" | "chat_completions"
+    ) {
+        return Err(CodexxError::Config(
+            "供应商 wire_api 不受支持；Codex 客户端仅支持 Responses，请通过上游协议选择 Chat Completions、Anthropic Messages 或 Gemini".to_string(),
+        ));
+    }
+    let selected = provider.upstream_api.as_deref().map(str::trim);
+    provider.upstream_api =
+        match selected {
+            Some("responses" | "chat_completions" | "anthropic_messages" | "gemini") => {
+                selected.map(ToString::to_string)
+            }
+            Some(_) => return Err(CodexxError::Config(
+                "供应商上游协议必须是 responses、chat_completions、anthropic_messages 或 gemini"
+                    .to_string(),
+            )),
+            None if matches!(provider.wire_api.trim(), "chat" | "chat_completions") => {
+                Some("chat_completions".to_string())
+            }
+            None => None,
+        };
+    if provider.upstream_api.is_some() {
+        provider.wire_api = "responses".to_string();
+    }
+    Ok(())
 }
 
 fn sync_provider_toml_from_fields(provider: &mut SavedProvider) -> Result<()> {
@@ -1068,6 +1132,7 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
         } else {
             provider.wire_api.trim().to_string()
         },
+        upstream_api: provider.upstream_api,
         requires_openai_auth: provider.requires_openai_auth,
         model_mappings,
     };
@@ -1089,17 +1154,28 @@ pub(crate) fn normalize_saved_provider(provider: SavedProvider) -> Result<SavedP
     // reach this path. For an explicit user edit, the latest form fields win
     // while the full TOML (comments, MCP, projects, desktop settings, etc.) is
     // retained verbatim apart from the standard provider fields.
+    normalize_provider_upstream_api(&mut normalized)?;
     sync_provider_toml_from_fields(&mut normalized)?;
     Ok(normalized)
 }
 
 pub(crate) fn normalize_saved_provider_for_save(
     conn: &Connection,
-    provider: SavedProvider,
+    mut provider: SavedProvider,
 ) -> Result<SavedProvider> {
     let requested_id = provider.id.trim().to_string();
+    let existing = provider_by_id_on_connection(conn, &requested_id)?;
+    if provider.upstream_api.is_none()
+        && !matches!(provider.wire_api.trim(), "chat" | "chat_completions")
+    {
+        // Older clients omit this new app-only field. Preserve their existing
+        // route format; selecting native Responses explicitly uses Some(responses).
+        provider.upstream_api = existing
+            .as_ref()
+            .and_then(|saved| saved.upstream_api.clone());
+    }
     let mut normalized = normalize_saved_provider(provider)?;
-    if provider_by_id_on_connection(conn, &requested_id)?.is_some() {
+    if existing.is_some() {
         // Existing IDs are record identities. Preserve legacy reserved IDs such
         // as `custom` instead of treating an edit as a new normalized record.
         normalized.id = requested_id;
@@ -1182,6 +1258,7 @@ fn duplicate_provider_on_connection(
             if let Some(original) = saved.iter().find(|provider| &provider.id == saved_id) {
                 detected.id = original.id.clone();
                 detected.model_mappings = original.model_mappings.clone();
+                detected.upstream_api = original.upstream_api.clone();
                 if detected.api_key.is_none() {
                     detected.api_key = original.api_key.clone();
                 }
@@ -1273,6 +1350,7 @@ pub(crate) fn save_detected_provider_with_rollback_inner(
         [saved_id] => {
             if let Some(saved) = saved.iter().find(|provider| &provider.id == saved_id) {
                 live.model_mappings = saved.model_mappings.clone();
+                live.upstream_api = saved.upstream_api.clone();
             }
             if live.api_key.is_none() {
                 live.api_key = saved
@@ -1309,8 +1387,8 @@ fn insert_stored_provider(conn: &Connection, stored: &StoredProvider) -> Result<
     conn.execute(
         "INSERT INTO providers
             (id, provider_name, base_url, model, api_key, toml_config, wire_api,
-             requires_openai_auth, model_mappings_json, source, source_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             requires_openai_auth, model_mappings_json, upstream_api, source, source_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             provider.id,
             provider.provider_name,
@@ -1321,6 +1399,7 @@ fn insert_stored_provider(conn: &Connection, stored: &StoredProvider) -> Result<
             provider.wire_api,
             if provider.requires_openai_auth { 1 } else { 0 },
             model_mappings_json,
+            provider.upstream_api,
             stored.source,
             stored.source_id,
             stored.created_at,
@@ -1602,6 +1681,7 @@ command = "fixture-server"
                 wire_api TEXT NOT NULL DEFAULT 'responses',
                 requires_openai_auth INTEGER NOT NULL DEFAULT 1,
                 model_mappings_json TEXT NOT NULL DEFAULT '[]',
+                upstream_api TEXT,
                 source TEXT NOT NULL DEFAULT 'manual',
                 source_id TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
@@ -1620,8 +1700,167 @@ command = "fixture-server"
             toml_config: None,
             wire_api: "responses".to_string(),
             requires_openai_auth: true,
+            upstream_api: None,
             model_mappings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bridge_protocol_metadata_defaults_for_old_payloads_and_validates_on_save() {
+        let old = serde_json::json!({
+            "id":"old", "providerName":"Old", "baseUrl":"https://upstream.example.test/v1",
+            "model":"gpt-test", "apiKey":null, "tomlConfig":null,
+            "wireApi":"responses", "requiresOpenaiAuth":false,
+        });
+        let parsed = serde_json::from_value::<SavedProvider>(old).unwrap();
+        assert!(parsed.upstream_api.is_none());
+        for protocol in [
+            "responses",
+            "chat_completions",
+            "anthropic_messages",
+            "gemini",
+        ] {
+            let mut selected = provider("bridge", "Bridge", None);
+            selected.upstream_api = Some(format!(" {protocol} "));
+            selected.toml_config = Some(HEADER_CONFIG.to_string());
+            let normalized = normalize_saved_provider(selected).unwrap();
+            assert_eq!(normalized.upstream_api.as_deref(), Some(protocol));
+            assert_eq!(normalized.wire_api, "responses");
+            let doc = normalized
+                .toml_config
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                doc["model_providers"]["custom"]["wire_api"].as_str(),
+                Some("responses")
+            );
+            assert!(doc["model_providers"]["custom"]
+                .as_table()
+                .unwrap()
+                .get("upstream_api")
+                .is_none());
+        }
+        let mut invalid = provider("bad-protocol", "Bad protocol", None);
+        invalid.upstream_api = Some("unknown".into());
+        assert!(normalize_saved_provider(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("上游协议"));
+    }
+
+    #[test]
+    fn legacy_chat_wire_api_migrates_to_independent_bridge_metadata() {
+        for legacy in ["chat", "chat_completions"] {
+            let conn = test_connection();
+            let mut old = provider("legacy-chat", "Legacy chat", None);
+            old.toml_config = Some(HEADER_CONFIG.replace(
+                "wire_api = \"responses\"",
+                &format!("wire_api = \"{legacy}\""),
+            ));
+            // The TOML remains authoritative when old DB scalar columns disagree.
+            write_provider_on_connection(&conn, &old).unwrap();
+            let migrated = provider_by_id_on_connection(&conn, &old.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(migrated.wire_api, "responses");
+            assert_eq!(migrated.upstream_api.as_deref(), Some("chat_completions"));
+            let text = migrated.toml_config.as_ref().unwrap();
+            assert!(text.contains("# keep the shared configuration"));
+            assert_eq!(
+                text.parse::<DocumentMut>().unwrap()["model_providers"]["custom"]["wire_api"]
+                    .as_str(),
+                Some("responses")
+            );
+            let saved = save_manual_provider_on_connection(&conn, migrated).unwrap();
+            assert_eq!(saved.upstream_api.as_deref(), Some("chat_completions"));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT wire_api FROM providers WHERE id=?1",
+                    [&saved.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "responses"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_legacy_wire_api_remains_readable_and_is_rejected_on_save() {
+        let conn = test_connection();
+        let mut unknown = provider("unknown-wire", "Unknown wire", None);
+        unknown.wire_api = "unrecognized-wire-format".into();
+        write_provider_on_connection(&conn, &unknown).unwrap();
+        let read = provider_by_id_on_connection(&conn, &unknown.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.wire_api, "unrecognized-wire-format");
+        assert!(read.upstream_api.is_none());
+        assert!(save_manual_provider_on_connection(&conn, read)
+            .unwrap_err()
+            .to_string()
+            .contains("wire_api 不受支持"));
+    }
+
+    #[test]
+    fn edits_from_older_clients_keep_bridge_metadata_until_explicitly_reset() {
+        let conn = test_connection();
+        let mut configured = provider("configured", "Configured", None);
+        configured.upstream_api = Some("anthropic_messages".into());
+        let saved = save_manual_provider_on_connection(&conn, configured).unwrap();
+        let mut older_edit = saved.clone();
+        older_edit.upstream_api = None;
+        older_edit.provider_name = "Renamed".into();
+        let preserved = save_manual_provider_on_connection(&conn, older_edit).unwrap();
+        assert_eq!(preserved.upstream_api, saved.upstream_api);
+        let mut native = preserved;
+        native.upstream_api = Some("responses".into());
+        let reset = save_manual_provider_on_connection(&conn, native).unwrap();
+        assert_eq!(reset.upstream_api.as_deref(), Some("responses"));
+    }
+
+    #[test]
+    fn upstream_metadata_and_headers_survive_store_copy_import_refresh_and_snapshot_restore() {
+        let mut conn = test_connection();
+        let mut original = provider("gemini-bridge", "Gemini bridge", Some("fixture-key"));
+        original.upstream_api = Some("gemini".into());
+        original.toml_config = Some(HEADER_CONFIG.to_string());
+        let original = normalize_saved_provider(original).unwrap();
+        let saved =
+            upsert_ccswitch_provider_on_connection(&conn, original.clone(), "ccswitch-fixture")
+                .unwrap()
+                .provider;
+        assert_eq!(saved.upstream_api.as_deref(), Some("gemini"));
+        let copied = duplicate_provider_on_connection(
+            &mut conn,
+            std::path::Path::new("/fixture/upstream-copy"),
+            None,
+            Some(&saved.id),
+            None,
+        )
+        .unwrap()
+        .provider;
+        assert_eq!(copied.upstream_api, saved.upstream_api);
+        assert_eq!(
+            read_provider_headers_inner(copied.toml_config.unwrap()).unwrap(),
+            read_provider_headers_inner(saved.toml_config.clone().unwrap()).unwrap()
+        );
+        let mut incoming = original;
+        incoming.upstream_api = None;
+        let refreshed = upsert_ccswitch_provider_on_connection(&conn, incoming, "ccswitch-fixture")
+            .unwrap()
+            .provider;
+        assert_eq!(refreshed.upstream_api.as_deref(), Some("gemini"));
+        let snapshots = stored_providers_on_connection(&conn).unwrap();
+        let restored = test_connection();
+        for snapshot in &snapshots {
+            insert_stored_provider(&restored, snapshot).unwrap();
+        }
+        assert_eq!(
+            stored_providers_on_connection(&restored).unwrap(),
+            snapshots
+        );
     }
 
     fn provider_count(conn: &Connection) -> usize {
@@ -2440,6 +2679,7 @@ enabled = true
             toml_config: Some("\n".to_string()),
             wire_api: String::new(),
             requires_openai_auth: false,
+            upstream_api: None,
             model_mappings: Vec::new(),
         };
         let result = upsert_ccswitch_provider_on_connection(&conn, missing, "cc-row")
@@ -2684,7 +2924,8 @@ command = "keep-this-command"
         assert_eq!(normalized.provider_name, "Edited Name");
         assert_eq!(normalized.base_url, "https://edited.example.com/v1");
         assert_eq!(normalized.model, "edited-model");
-        assert_eq!(normalized.wire_api, "chat_completions");
+        assert_eq!(normalized.wire_api, "responses");
+        assert_eq!(normalized.upstream_api.as_deref(), Some("chat_completions"));
         assert!(!normalized.requires_openai_auth);
         assert_eq!(doc["model"].as_str(), Some("edited-model"));
         assert_eq!(
@@ -2697,7 +2938,7 @@ command = "keep-this-command"
         );
         assert_eq!(
             doc["model_providers"]["proxy"]["wire_api"].as_str(),
-            Some("chat_completions")
+            Some("responses")
         );
         assert_eq!(
             doc["model_providers"]["proxy"]["requires_openai_auth"].as_bool(),

@@ -583,6 +583,7 @@ pub(crate) fn detected_live_custom_provider(codex_dir: &Path) -> Result<Option<S
         toml_config: (!toml_config.is_empty()).then_some(toml_config),
         wire_api: section.wire_api,
         requires_openai_auth: section.requires_openai_auth,
+        upstream_api: None,
         model_mappings: Vec::new(),
     }))
 }
@@ -1842,6 +1843,7 @@ requires_openai_auth = false
             )),
             wire_api: "responses".to_string(),
             requires_openai_auth: false,
+            upstream_api: None,
             model_mappings: Vec::new(),
         }
     }
@@ -2327,6 +2329,7 @@ command = "docs-server"
                 toml_config: None,
                 wire_api: "responses".to_string(),
                 requires_openai_auth: false,
+                upstream_api: None,
                 model_mappings: Vec::new(),
             },
             Some(codex_dir.display().to_string()),

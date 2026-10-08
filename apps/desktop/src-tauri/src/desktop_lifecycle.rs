@@ -149,7 +149,9 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
             report_failover_lifecycle_error(
                 app,
                 "暂时无法退出 Codex-X",
-                &format!("自动切换的连接配置还未恢复，Codex-X 将继续运行。\n\n{error}\n\n请检查配置文件是否被占用，再重试退出。"),
+                &format!(
+                    "路由仍需保持可用，Codex-X 将继续运行。\n\n{error}\n\n请按提示处理后再退出。"
+                ),
             );
         }
     }

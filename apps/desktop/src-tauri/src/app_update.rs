@@ -95,6 +95,24 @@ fn failure(stage: FailureStage, message: &str, log: Option<&UpdateLog>) -> Updat
     }
 }
 
+/// Check before changing the installed application on every platform. The
+/// converted supplier cannot resume through a raw Responses endpoint after exit.
+fn install_with_route_preflight<T>(
+    check: impl FnOnce() -> Result<(), ()>,
+    install: impl FnOnce() -> Result<T, UpdateFailure>,
+    log: &UpdateLog,
+) -> Result<T, UpdateFailure> {
+    if check().is_err() {
+        log.record("conversion_route_blocks_install");
+        return Err(failure(
+            FailureStage::Prepare,
+            "当前供应商需要协议转换。请先切换到 Responses 供应商或官方账号，再更新 Codex-X；安装尚未开始。",
+            Some(log),
+        ));
+    }
+    install()
+}
+
 /// This log contains only our fixed stage names and version, never URLs,
 /// headers, auth/config contents or raw network/parser error messages.
 struct UpdateLog {
@@ -283,17 +301,24 @@ pub(crate) async fn install_app_update(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = on_event.send(AppUpdateEvent::Installing);
-        log.record("install_started");
+        let _ = on_event.send(AppUpdateEvent::Preparing);
         tauri::async_runtime::spawn_blocking(move || {
-            update.install(bytes).map_err(|_| {
-                log.record("install_failed");
-                failure(
-                    FailureStage::Install,
-                    "安装更新未完成，请重试或前往下载页安装。",
-                    Some(&log),
-                )
-            })?;
+            install_with_route_preflight(
+                || crate::failover::ensure_shutdown_allowed().map_err(|_| ()),
+                || {
+                    let _ = on_event.send(AppUpdateEvent::Installing);
+                    log.record("install_started");
+                    update.install(bytes).map_err(|_| {
+                        log.record("install_failed");
+                        failure(
+                            FailureStage::Install,
+                            "安装更新未完成，请重试或前往下载页安装。",
+                            Some(&log),
+                        )
+                    })
+                },
+                &log,
+            )?;
             log.record("install_finished_restart_required");
             Ok(InstallResult {
                 restart_required: true,
@@ -332,14 +357,20 @@ async fn install_windows(
         })?;
         let _ = on_event.send(AppUpdateEvent::Preparing);
         log.record("preparing_route_shutdown");
-        prepared_install(
-            || crate::failover::shutdown_all().map_err(|_| ()),
+        install_with_route_preflight(
+            || crate::failover::ensure_shutdown_allowed().map_err(|_| ()),
             || {
-                let _ = on_event.send(AppUpdateEvent::Installing);
-                log.record("launching_installer");
-                installer.launch(std::process::id()).map_err(|_| ())
+                prepared_install(
+                    || crate::failover::shutdown_all().map_err(|_| ()),
+                    || {
+                        let _ = on_event.send(AppUpdateEvent::Installing);
+                        log.record("launching_installer");
+                        installer.launch(std::process::id()).map_err(|_| ())
+                    },
+                    || crate::failover::resume_after_failed_update().map_err(|_| ()),
+                    &log,
+                )
             },
-            || crate::failover::resume_after_failed_update().map_err(|_| ()),
             &log,
         )?;
         log.record("installer_handed_off");
@@ -365,6 +396,57 @@ async fn install_windows(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn conversion_preflight_blocks_install_before_application_bytes_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = UpdateLog::create(temp.path(), "0.4.0").unwrap();
+        let app = temp.path().join("fixture-app");
+        fs::write(&app, b"original fixture").unwrap();
+        let error = install_with_route_preflight(
+            || Err(()),
+            || {
+                fs::write(&app, b"replacement fixture").unwrap();
+                Ok(())
+            },
+            &log,
+        )
+        .unwrap_err();
+        assert_eq!(error.stage, FailureStage::Prepare);
+        assert!(error.message.contains("协议转换"));
+        assert!(error.message.contains("Responses"));
+        assert!(error.message.contains("安装尚未开始"));
+        assert_eq!(fs::read(&app).unwrap(), b"original fixture");
+        let stages = fs::read_to_string(&log.path).unwrap();
+        assert!(stages.contains("conversion_route_blocks_install"));
+        assert!(!stages.contains("install_started"));
+    }
+
+    #[test]
+    fn native_route_preflight_installs_once_and_preserves_installer_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = UpdateLog::create(temp.path(), "0.4.0").unwrap();
+        let calls = RefCell::new(vec![]);
+        let error = install_with_route_preflight(
+            || {
+                calls.borrow_mut().push("check");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("install");
+                Err::<(), _>(failure(
+                    FailureStage::Install,
+                    "fixture install error",
+                    Some(&log),
+                ))
+            },
+            &log,
+        )
+        .unwrap_err();
+        assert_eq!(*calls.borrow(), vec!["check", "install"]);
+        assert_eq!(error.stage, FailureStage::Install);
+        assert_eq!(error.message, "fixture install error");
+    }
 
     #[test]
     fn one_update_at_a_time_and_errors_release_the_guard() {

@@ -1134,6 +1134,11 @@ async fn activate_saved_provider(
     provider_id: String,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let provider = providers::list_saved_providers_inner()?
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| CodexxError::Config("供应商不存在".to_string()))?;
+        failover::ensure_conversion_route(config_dir.clone(), &provider)?;
         failover::with_provider_change(config_dir.clone(), || {
             let result = providers::activate_saved_provider_inner(config_dir, provider_id.clone())?;
             Ok(finish_provider_selection(
@@ -1153,6 +1158,9 @@ async fn save_active_provider(
     apply_common_config: Option<bool>,
 ) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
+        let provider =
+            providers::normalize_saved_provider_for_save(&providers::open_store()?, provider)?;
+        failover::ensure_conversion_route(config_dir.clone(), &provider)?;
         let result = failover::with_provider_change(config_dir.clone(), || {
             let provider_id = provider.id.clone();
             let result = if apply_common_config.unwrap_or(false) {
@@ -1588,20 +1596,46 @@ async fn save_provider_toml_config(
 async fn test_provider_connection(
     base_url: String,
     api_key: Option<String>,
+    upstream_api: Option<String>,
+    config_text: Option<String>,
 ) -> Result<ProviderConnectionResult> {
-    tauri::async_runtime::spawn_blocking(move || test_provider_connection_inner(base_url, api_key))
-        .await
-        .map_err(|e| CodexxError::Config(format!("测试连接失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        if upstream_api.is_none() && config_text.is_none() {
+            test_provider_connection_inner(base_url, api_key)
+        } else {
+            providers::test_provider_connection_with_protocol_inner(
+                base_url,
+                api_key,
+                upstream_api,
+                config_text,
+            )
+        }
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("测试连接失败: {e}")))?
 }
 
 #[tauri::command]
 async fn fetch_provider_models(
     base_url: String,
     api_key: Option<String>,
+    upstream_api: Option<String>,
+    config_text: Option<String>,
 ) -> Result<ProviderModelsResult> {
-    tauri::async_runtime::spawn_blocking(move || fetch_provider_models_inner(base_url, api_key))
-        .await
-        .map_err(|e| CodexxError::Config(format!("获取模型列表失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        if upstream_api.is_none() && config_text.is_none() {
+            fetch_provider_models_inner(base_url, api_key)
+        } else {
+            providers::fetch_provider_models_with_protocol_inner(
+                base_url,
+                api_key,
+                upstream_api,
+                config_text,
+            )
+        }
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("获取模型列表失败: {e}")))?
 }
 
 #[tauri::command]

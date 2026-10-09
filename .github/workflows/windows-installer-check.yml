@@ -39,6 +39,11 @@ jobs:
           cache-on-failure: true
       - run: pnpm install --frozen-lockfile
       - run: pnpm --dir apps/desktop typecheck
+      - run: node --test apps/desktop/tests/*.test.mjs
+      - name: Verify SDK TLS fixture tooling
+        run: |
+          $openssl = Get-Command openssl -ErrorAction Stop
+          & $openssl.Source version
       - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1
       - name: Build test installer without publishing or release signing credentials
         run: |

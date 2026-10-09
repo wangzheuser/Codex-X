@@ -221,6 +221,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Check frontend types and regressions
+        run: |
+          pnpm --dir apps/desktop typecheck
+          node --test apps/desktop/tests/*.test.mjs
+
+      - name: Verify Windows SDK test tooling
+        if: matrix.platform == 'windows-latest'
+        run: |
+          command -v openssl
+          openssl version
+
       - name: Test Windows filesystem compatibility
         if: matrix.platform == 'windows-latest'
         run: cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1

@@ -87,6 +87,12 @@ if ($probe.Code -eq 0) {
 }
 [System.IO.File]::WriteAllText((Join-Path $reviewDirectory 'extract-before.log'), $probe.Text)
 
+$hasDefinitionIdentity = $false
+if ($probe.Code -eq 0) {
+    [xml]$before = Get-Content -LiteralPath $beforeManifest -Raw
+    $hasDefinitionIdentity = $null -ne $before.SelectSingleNode("/*[local-name()='assembly']/*[local-name()='assemblyIdentity']")
+}
+
 # Same dependency tuple as tauri-build's default windows-app-manifest.xml.
 $addition = @'
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -98,6 +104,16 @@ $addition = @'
 </assembly>
 '@
 [System.IO.File]::WriteAllText($additionManifest, $addition, [System.Text.UTF8Encoding]::new($false))
+if (-not $hasDefinitionIdentity) {
+    [xml]$definition = $addition
+    $identity = $definition.CreateElement('assemblyIdentity', $definition.DocumentElement.NamespaceURI)
+    $identity.SetAttribute('type', 'win32')
+    $identity.SetAttribute('name', 'Codex-X.TestHarness')
+    $identity.SetAttribute('version', '1.0.0.0')
+    $identity.SetAttribute('processorArchitecture', 'amd64')
+    [void]$definition.DocumentElement.PrependChild($identity)
+    [System.IO.File]::WriteAllText($additionManifest, $definition.OuterXml, [System.Text.UTF8Encoding]::new($false))
+}
 Require-ManifestTool (@('-nologo', '-manifest') + $inputs + @("-out:$mergedManifest"))
 Require-ManifestTool @('-nologo', '-manifest', $mergedManifest, '-validate_manifest')
 Require-ManifestTool @('-nologo', '-manifest', $mergedManifest, "-outputresource:$testExecutable;#1")
@@ -105,6 +121,9 @@ Require-ManifestTool @('-nologo', "-inputresource:$testExecutable;#1", "-out:$ex
 [xml]$embedded = Get-Content -LiteralPath $extractedManifest -Raw
 $identity = $embedded.SelectSingleNode("//*[local-name()='dependency']/*[local-name()='dependentAssembly']/*[local-name()='assemblyIdentity'][@name='Microsoft.Windows.Common-Controls' and @version='6.0.0.0' and @publicKeyToken='6595b64144ccf1df']")
 if ($null -eq $identity) { throw 'Extracted harness manifest lacks the Common Controls v6 dependency.' }
+if ($null -eq $embedded.SelectSingleNode("/*[local-name()='assembly']/*[local-name()='assemblyIdentity']")) {
+    throw 'Extracted harness manifest lacks its definition identity.'
+}
 
 [ordered]@{
     testExecutable = $testExecutable

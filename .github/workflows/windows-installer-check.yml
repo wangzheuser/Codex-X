@@ -45,7 +45,13 @@ jobs:
           $openssl = Get-Command openssl -ErrorAction Stop
           & $openssl.Source version
       - name: Run Windows release tests
-        run: cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+        run: |
+          $artifacts = Join-Path $env:RUNNER_TEMP 'codexx-test-artifacts.json'
+          cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked --no-run --message-format=json > $artifacts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/ensure-test-common-controls.ps1 -CargoJson $artifacts -OutputDirectory $env:RUNNER_TEMP
+          cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Diagnose failed Windows test loader
         if: failure()
         run: ./scripts/windows-dll-diagnostics.ps1 -RunHarnessList

@@ -186,6 +186,16 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
+      - name: Checkout Windows test harness tooling
+        if: matrix.platform == 'windows-latest'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-tools
+          sparse-checkout: scripts/ensure-test-common-controls.ps1
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -234,7 +244,14 @@ jobs:
 
       - name: Test Windows filesystem compatibility
         if: matrix.platform == 'windows-latest'
-        run: cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+        shell: pwsh
+        run: |
+          $artifacts = Join-Path $env:RUNNER_TEMP 'codexx-test-artifacts.json'
+          cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked --no-run --message-format=json > $artifacts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./.ci-tools/scripts/ensure-test-common-controls.ps1 -CargoJson $artifacts -OutputDirectory $env:RUNNER_TEMP
+          cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml --lib --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Import Apple signing certificate and notarization key
         if: matrix.macos

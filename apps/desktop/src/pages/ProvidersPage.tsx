@@ -969,8 +969,8 @@ function ProviderForm({
           {providerUpstreamApi(providerForm) !== "responses" && (
             <p className="cx-providers-field--full cx-providers-protocol-hint">
               {lang === "zh"
-                ? "Codex 仍使用 Responses。本协议需在设置中开启本地路由和配置接管；使用期间请保持 Codex-X 运行。关闭路由或退出前，请切回 Responses 供应商或官方账号。"
-                : "Codex still uses Responses. Enable the local router and config takeover in Settings, and keep Codex-X running. Switch to a Responses provider or official account before disabling the router or quitting."}
+                ? "Codex 仍使用 Responses。本协议需在设置中开启本地路由和配置接管；使用期间请保持 Codex-X 运行。关闭路由前请切回 Responses 供应商或官方账号；退出期间请求会暂停，重开后自动恢复。"
+                : "Codex still uses Responses. Enable the local router and config takeover in Settings, and keep Codex-X running. Switch to a Responses provider or official account before disabling the router. Requests pause while Codex-X is closed and resume after reopening."}
             </p>
           )}
           <Checkbox

@@ -1,3 +1,4 @@
+import { releaseInfoFromFallback, releaseInfoFromCheckFailure } from "./updateCheckFlow";
 import { providerUpstreamApi, providerRequiresConversion } from "./providerProtocol";
 import React from "react";
 import { flushSync } from "react-dom";
@@ -2187,9 +2188,11 @@ function App() {
 
   const checkForUpdates = React.useCallback(async ({ quiet = false }: { quiet?: boolean } = {}) => {
     setReleaseInfo({ status: "checking" });
+    let nativeCheckAttempted = false;
     try {
       if (aboutInfo?.nativeUpdaterSupported !== false) {
-        const updaterResult = await appUpdater.check({ force: !quiet, timeout: 15_000 });
+        nativeCheckAttempted = true;
+        const updaterResult = await appUpdater.check({ force: !quiet, timeout: 30_000 });
         if (updaterResult === "available") {
           const snapshot = appUpdater.getSnapshot();
           const latestVersion = snapshot.latestVersion || "";
@@ -2215,25 +2218,27 @@ function App() {
             latestVersion: aboutInfo?.appVersion,
             htmlUrl: `https://github.com/${FALLBACK_GITHUB_REPO}/releases/latest`,
             hasUpdate: false,
+            updateMethod: "native",
           });
           if (!quiet) setToast(lang === "zh" ? "当前已是最新版本" : "You are up to date");
           return;
         }
       }
 
-      // Keep the existing lightweight release check as a manual-download fallback for
-      // bootstrap and portable builds that cannot use the native updater yet.
+      // Metadata is useful even when the native channel is unavailable. It
+      // cannot supply an updater RID or replace the signed installation check.
       const update = await invoke<AppUpdateInfo>("check_app_update");
-      const message = update.hasUpdate
-        ? (lang === "zh" ? "发现新版本" : "Update available")
-        : (lang === "zh" ? "当前已是最新版本" : "You are up to date");
-      setReleaseInfo({
-        status: "ok",
-        latestVersion: update.latestVersion,
-        htmlUrl: update.htmlUrl,
-        hasUpdate: update.hasUpdate,
-        updateMethod: update.hasUpdate ? "download" : undefined,
-      });
+      setReleaseInfo(releaseInfoFromFallback(update, nativeCheckAttempted));
+      if (nativeCheckAttempted) {
+        if (quiet && update.hasUpdate) {
+          setToast(lang === "zh"
+            ? `发现新版本 ${update.latestVersion}，但在线更新检查失败，可重新检查`
+            : `Version ${update.latestVersion} is available, but the in-app update check failed. Retry the check`);
+        } else if (!quiet) {
+          setUpdatePromptOpen(true);
+        }
+        return;
+      }
       if (update.hasUpdate) {
         if (quiet) {
           setToast(lang === "zh" ? `发现新版本 ${update.latestVersion}，可在概览页查看` : `New version ${update.latestVersion} is available`);
@@ -2241,14 +2246,15 @@ function App() {
           setUpdatePromptOpen(true);
         }
       } else if (!quiet) {
-        setToast(message);
+        setToast(lang === "zh" ? "当前已是最新版本" : "You are up to date");
       }
     } catch {
-      const message = quiet ? (lang === "zh" ? "自动检查失败" : "Auto check failed") : (lang === "zh" ? "检查失败" : "Check failed");
-      setReleaseInfo({
-        status: "error",
-      });
-      if (!quiet) setToast(message);
+      setReleaseInfo(releaseInfoFromCheckFailure(nativeCheckAttempted));
+      if (!quiet && nativeCheckAttempted) {
+        setUpdatePromptOpen(true);
+      } else if (!quiet) {
+        setToast(lang === "zh" ? "检查失败" : "Check failed");
+      }
     }
   }, [aboutInfo?.appVersion, aboutInfo?.nativeUpdaterSupported, lang]);
 
@@ -3043,7 +3049,10 @@ function App() {
         latestVersion={releaseInfo.latestVersion}
         onClose={() => setUpdatePromptOpen(false)}
         onUpdate={releaseInfo.updateMethod === "native" ? updater.downloadAndInstall : undefined}
-        onRetry={releaseInfo.updateMethod === "native" ? updater.retry : undefined}
+        onRetry={releaseInfo.updateMethod === "native" ? async () => {
+          if (updater.state.failure === "check") await checkForUpdates();
+          else await updater.retry();
+        } : undefined}
         onRestart={releaseInfo.updateMethod === "native" ? updater.restart : undefined}
         onDownload={() => {
           setUpdatePromptOpen(false);

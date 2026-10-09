@@ -1168,7 +1168,10 @@ pub(crate) fn get_status(config_dir: Option<String>) -> Result<FailoverStatus> {
     let dir = directory(config_dir)?;
     let mut runtimes = lock_manager()?;
     let mut record = load_record(&dir)?;
-    if let Some(runtime) = runtimes.get_mut(&dir) {
+    if let Some(runtime) = runtimes
+        .get_mut(&dir)
+        .filter(|_| !SHUTTING_DOWN.load(Ordering::Acquire))
+    {
         inspect_external_change(&dir, &mut record, runtime)?;
     }
     status_locked(&dir, record, runtimes.get(&dir))
@@ -1310,6 +1313,11 @@ pub(crate) fn with_provider_change<T>(
 ) -> Result<T> {
     let dir = directory(config_dir)?;
     let mut runtimes = lock_manager()?;
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Err(CodexxError::Config(
+            "Codex-X 正在退出或交接更新，未更改供应商配置".into(),
+        ));
+    }
     let mut record = load_record(&dir)?;
     let Some(runtime) = runtimes.get_mut(&dir) else {
         drop(runtimes);
@@ -1436,6 +1444,11 @@ fn refresh_routes_locked(dir: &Path, record: &mut Record, runtime: &mut Running)
 }
 pub(crate) fn refresh_saved_routes() -> Result<()> {
     let mut runtimes = lock_manager()?;
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Err(CodexxError::Config(
+            "Codex-X 正在退出或交接更新，未更改路由配置".into(),
+        ));
+    }
     for (dir, runtime) in runtimes.iter_mut() {
         let mut record = load_record(dir)?;
         refresh_routes_locked(dir, &mut record, runtime)?;
@@ -1458,6 +1471,9 @@ fn record_selection(
     notice: SelectionNotice,
     runtimes: &mut HashMap<PathBuf, Running>,
 ) -> Result<()> {
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let Some(runtime) = runtimes.get_mut(&notice.dir) else {
         return Ok(());
     };
@@ -1677,6 +1693,9 @@ fn ensure_watcher() {
                 let Ok(mut runtimes) = lock_manager() else {
                     continue;
                 };
+                if SHUTTING_DOWN.load(Ordering::Acquire) {
+                    continue;
+                }
                 let events: Vec<_> = notices()
                     .1
                     .lock()
@@ -1703,16 +1722,20 @@ fn ensure_watcher() {
     });
 }
 fn shutdown_allowed_locked(runtimes: &HashMap<PathBuf, Running>) -> Result<()> {
-    if runtimes.values().any(|runtime| {
-        runtime
-            .journal
-            .as_ref()
-            .is_some_and(|journal| journal.requires_conversion)
-    }) {
-        return Err(CodexxError::Config(
-            "当前供应商需要协议转换。请先切换到 Responses 供应商或官方账号，再退出或更新 Codex-X。"
-                .into(),
-        ));
+    for (dir, runtime) in runtimes {
+        let Some(journal) = runtime.journal.as_ref() else {
+            continue;
+        };
+        let doc = read_document(dir)?.1;
+        if journal.requires_conversion && owned_route(&doc, journal) {
+            let record = load_record(dir)?;
+            let persisted=record.journals.iter().find(|saved| saved.requires_conversion && saved.primary_id==journal.primary_id && saved.provider_key==journal.provider_key && saved.token==journal.token && saved.lease_id==journal.lease_id && owned_route(&doc,saved))
+                .ok_or_else(||CodexxError::Config("转换路由的恢复记录缺失，服务继续运行；请重新启用 Codex 接管后重试退出或更新。".into()))?;
+            original_table(persisted)?;
+        } else if !journal.requires_conversion {
+            // Validate the existing native restore projection without writing.
+            restored_document(&doc, journal)?;
+        }
     }
     Ok(())
 }
@@ -1723,6 +1746,15 @@ pub(crate) fn ensure_shutdown_allowed() -> Result<()> {
     shutdown_allowed_locked(&runtimes)
 }
 
+/// Freeze configuration mutations during an update while keeping active
+/// requests and the listener alive until the installer needs the process exit.
+pub(crate) fn begin_update_handoff() -> Result<()> {
+    let runtimes = lock_manager()?;
+    shutdown_allowed_locked(&runtimes)?;
+    SHUTTING_DOWN.store(true, Ordering::Release);
+    Ok(())
+}
+
 pub(crate) fn shutdown_all() -> Result<()> {
     SHUTTING_DOWN.store(true, Ordering::Release);
     let result = (|| -> Result<()> {
@@ -1730,11 +1762,41 @@ pub(crate) fn shutdown_all() -> Result<()> {
         shutdown_allowed_locked(&runtimes)?;
         let dirs: Vec<_> = runtimes.keys().cloned().collect();
         for dir in dirs {
-            let record = load_record(&dir)?;
+            let mut record = load_record(&dir)?;
             if let Some(runtime) = runtimes.get_mut(&dir) {
-                detach_route(&dir, &record, runtime)?;
+                if let Some(journal) = runtime
+                    .journal
+                    .as_ref()
+                    .filter(|journal| journal.requires_conversion)
+                {
+                    let previous_settings = record.settings.clone();
+                    let previous_message = record.message.clone();
+                    let doc = read_document(&dir)?.1;
+                    if !selected_owned_route(&doc, journal) {
+                        // An explicit external selection is kept exactly as it
+                        // is; the next launch must not take it over implicitly.
+                        record.settings.takeover_enabled = false;
+                        record.message = Some(
+                            "退出时检测到外部供应商配置，已原样保留；下次启动不会自动接管该配置。"
+                                .into(),
+                        );
+                    } else {
+                        record.settings.router_enabled = true;
+                        record.settings.takeover_enabled = true;
+                        record.settings.listen_address = runtime.proxy.listen_address().to_string();
+                        record.settings.listen_port = runtime.proxy.port();
+                    }
+                    if record.settings != previous_settings || record.message != previous_message {
+                        save_record(&dir, &record)?;
+                    }
+                    // Keep the owned loopback overlay and recovery journal.
+                    // initialize reconnects it on the next app launch. Restoring
+                    // this supplier's raw URL would send an invalid /responses.
+                } else {
+                    detach_route(&dir, &record, runtime)?;
+                }
             }
-            // Keep desired settings for next launch; restore first, stop last.
+            // All required writes/validation finish before stopping a listener.
             if let Some(runtime) = runtimes.remove(&dir) {
                 runtime.proxy.shutdown();
             }
@@ -1749,7 +1811,6 @@ pub(crate) fn shutdown_all() -> Result<()> {
 
 /// Only an update handoff that has not launched an installer may resume the
 /// saved routes. A successful handoff keeps the shutdown gate closed until exit.
-#[cfg(any(test, target_os = "windows"))]
 pub(crate) fn resume_after_failed_update() -> Result<()> {
     SHUTTING_DOWN.store(false, Ordering::Release);
     let expected: Vec<_> = stored_directories()?

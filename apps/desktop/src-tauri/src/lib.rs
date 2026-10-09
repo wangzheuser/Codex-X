@@ -15,6 +15,7 @@ use std::process::Command;
 
 mod app_db;
 mod app_update;
+mod app_update_channel;
 mod backups;
 mod ccswitch;
 mod config_health;
@@ -1858,6 +1859,7 @@ pub fn run() {
         })
         .on_window_event(desktop_lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
+            app_update_channel::check_online_app_update,
             app_update::install_app_update,
             get_about_info,
             restart_codex_desktop,

@@ -236,7 +236,7 @@ for (const lang of ["zh", "en"]) {
       assert.equal(selectedOption(protocolSelect(html)).attrs.value, protocol);
       const hint = elements(html, "p").find(({ attrs }) => attrs.class?.includes("cx-providers-protocol-hint"));
       assert.ok(hint, `routing explanation for ${protocol}`);
-      for (const text of zh ? ["Codex 仍使用 Responses", "开启本地路由和配置接管", "保持 Codex-X 运行", "退出前", "切回 Responses"] : ["Codex still uses Responses", "local router and config takeover", "keep Codex-X running", "before disabling the router or quitting"]) assert.ok(hint.tag.includes(text), text);
+      for (const text of zh ? ["Codex 仍使用 Responses", "开启本地路由和配置接管", "保持 Codex-X 运行", "退出期间请求会暂停", "重开后自动恢复", "切回 Responses"] : ["Codex still uses Responses", "local router and config takeover", "keep Codex-X running", "before disabling the router", "resume after reopening"]) assert.ok(hint.tag.includes(text), text);
     }
   });
 

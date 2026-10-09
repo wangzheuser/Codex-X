@@ -141,6 +141,13 @@ pub(crate) fn report_failover_lifecycle_error(app: &tauri::AppHandle, title: &st
 
 pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+        if crate::app_update::defer_exit_during_installation() {
+            // The installed bundle or updater handoff is being changed. A
+            // normal Quit must not interrupt it; Windows marks its authorized
+            // handoff before requesting process exit.
+            api.prevent_exit();
+            return;
+        }
         if let Err(error) = crate::failover::shutdown_all() {
             // Keep the listener alive when restoring the direct route failed.
             // Exiting here would strand Codex on a local address with no server.

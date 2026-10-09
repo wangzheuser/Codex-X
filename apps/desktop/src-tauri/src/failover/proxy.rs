@@ -2359,6 +2359,8 @@ mod tests {
         let result = request(&proxy, &stream_payload());
         release.send(()).unwrap();
         let result = result.into_string().unwrap();
+        // The client can receive EOF before the worker publishes final statistics.
+        eventually(|| proxy.snapshot().in_flight == 0);
         assert!(result.contains("response.failed"));
         assert!(!result.contains("response.completed"));
         assert!(untouched.observed().is_empty());
